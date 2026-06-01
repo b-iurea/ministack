@@ -315,6 +315,8 @@ def _iptables_build_commands(instance_id: str) -> list[str]:
     cmds: list[str] = []
 
     # ── Ingress ──────────────────────────────────────────────────────────
+    # Tear down old chain: remove the INPUT jump, then flush & delete.
+    cmds.append("iptables -D INPUT -j MINISTACK_IN 2>/dev/null || true")
     cmds.append("iptables -F MINISTACK_IN 2>/dev/null || true")
     cmds.append("iptables -X MINISTACK_IN 2>/dev/null || true")
     cmds.append("iptables -N MINISTACK_IN")
@@ -371,14 +373,16 @@ def _iptables_build_commands(instance_id: str) -> list[str]:
             else:
                 extra_egress.append(rule)
 
+    # Tear down old egress chain first
+    cmds.append("iptables -D OUTPUT -j MINISTACK_OUT 2>/dev/null || true")
+    cmds.append("iptables -F MINISTACK_OUT 2>/dev/null || true")
+    cmds.append("iptables -X MINISTACK_OUT 2>/dev/null || true")
+
     if has_allow_all:
-        # Default AWS behaviour: all outbound allowed
-        cmds.append("iptables -F MINISTACK_OUT 2>/dev/null || true")
-        cmds.append("iptables -X MINISTACK_OUT 2>/dev/null || true")
+        # Default AWS behaviour: all outbound allowed — chain stays deleted
+        pass
     else:
         # User revoked default allow-all → enforce egress restrictions
-        cmds.append("iptables -F MINISTACK_OUT 2>/dev/null || true")
-        cmds.append("iptables -X MINISTACK_OUT 2>/dev/null || true")
         cmds.append("iptables -N MINISTACK_OUT")
         cmds.append("iptables -A MINISTACK_OUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT")
         cmds.append("iptables -A MINISTACK_OUT -o lo -j ACCEPT")
@@ -4375,6 +4379,33 @@ def reset():
 # Action map
 # ---------------------------------------------------------------------------
 
+def _modify_instance_attribute(p):
+    """Handle ModifyInstanceAttribute — currently supports GroupId (security groups)."""
+    instance_id = _p(p, "InstanceId")
+    inst = _instances.get(instance_id)
+    if not inst:
+        return _error("InvalidInstanceID.NotFound",
+                      f"The instance ID '{instance_id}' does not exist", 400)
+
+    # Security group changes
+    sg_ids = _parse_member_list(p, "GroupId")
+    if sg_ids:
+        # Validate all SGs exist
+        for sg_id in sg_ids:
+            if sg_id not in _security_groups:
+                return _error("InvalidGroup.NotFound",
+                              f"The security group '{sg_id}' does not exist", 400)
+        # Replace the instance's security groups
+        inst["SecurityGroups"] = [
+            {"GroupId": sg, "GroupName": _security_groups[sg].get("GroupName", sg)}
+            for sg in sg_ids
+        ]
+        # Re-apply iptables with new rules
+        _iptables_apply(instance_id)
+
+    return _xml(200, "ModifyInstanceAttributeResponse", "<return>true</return>")
+
+
 def _describe_instance_attribute(p):
     instance_id = _p(p, "InstanceId")
     attribute = _p(p, "Attribute")
@@ -5109,6 +5140,7 @@ _ACTION_MAP = {
     "DescribeInstanceMaintenanceOptions": _describe_instance_maintenance_options,
     "DescribeInstanceAutoRecoveryAttribute": _describe_instance_auto_recovery_attribute,
     "ModifyInstanceMaintenanceOptions": _modify_instance_maintenance_options,
+    "ModifyInstanceAttribute": _modify_instance_attribute,
     "DescribeInstanceTopology": _describe_instance_topology,
     "DescribeSpotInstanceRequests": _describe_spot_instance_requests,
     "DescribeCapacityReservations": _describe_capacity_reservations,
