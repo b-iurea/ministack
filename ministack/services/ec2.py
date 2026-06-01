@@ -136,6 +136,20 @@ def _spawn_instance(instance_id: str, private_ip: str, subnet_id: str, tags: lis
 
         container = client.containers.run(**run_kwargs)
         logger.info("EC2: spawned container %s for instance %s (ip=%s vpc=%s)", container.id[:12], instance_id, private_ip, vpc_id)
+
+        # Update the instance record with the REAL Docker-assigned IP
+        inst = _instances.get(instance_id)
+        if inst:
+            container.reload()
+            nets = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+            for net_name, net_conf in nets.items():
+                real_ip = net_conf.get("IPAddress", "")
+                if real_ip:
+                    inst["PrivateIpAddress"] = real_ip
+                    inst["PrivateDnsName"] = f"ip-{real_ip.replace('.', '-')}.ec2.internal"
+                    logger.info("EC2: updated instance %s PrivateIp to %s", instance_id, real_ip)
+                    break
+
         return container.id
     except Exception as e:
         logger.warning("EC2: failed to spawn container for %s: %s", instance_id, e)
