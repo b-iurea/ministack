@@ -21,6 +21,16 @@
 
 ---
 
+---
+
+> ⚠️ **REAL INFRASTRUCTURE FORK** — This branch replaces mock services with real Docker containers.
+> - **EC2** instances = Alpine Linux containers with real networking
+> - **EKS** clusters = multi-node k3s Kubernetes with real worker nodes
+> - **VPCs** = isolated Docker bridge networks with real cross-VPC isolation
+> - **🚫 NOT the upstream MiniStack.** Use only if you need real infrastructure.
+> - **⚠️ Larger footprint** — each resource spawns a container. Not the ~30MB idle of upstream.
+> - **Upstream:** [ministackorg/ministack](https://github.com/ministackorg/ministack)
+
 ## Why MiniStack?
 
 LocalStack recently moved its core services behind a paid plan. If you relied on LocalStack Community for local development and CI/CD pipelines, MiniStack is your free alternative.
@@ -28,7 +38,8 @@ LocalStack recently moved its core services behind a paid plan. If you relied on
 - **56+ AWS services** emulated on a single port (4566)
 - **Drop-in compatible** — works with `boto3`, AWS CLI, Terraform, CDK, Pulumi, any SDK
 - **Real infrastructure** — RDS spins up actual Postgres/MySQL containers, ElastiCache spins up real Redis, Athena runs real SQL via DuckDB (full image only), ECS runs real Docker containers
-- **Tiny footprint** — ~270MB image, ~30MB RAM at idle vs LocalStack's ~1GB image and ~500MB RAM
+- **Tiny footprint** — ~270MB image, ~30MB RAM at idle vs LocalStack's ~1GB image and ~500MB RAM<br>*(Upstream only — this fork has larger footprint due to real Docker containers)*
+- **Real infrastructure** — EC2 instances as containers, EKS as multi-node k3s, VPCs as Docker networks
 - **Fast startup** — under 2 seconds, HTTP/2 (h2c) supported
 - **MIT licensed** — use it, fork it, contribute to it
 
@@ -47,6 +58,9 @@ docker run -p 4566:4566 ministackorg/ministack
 
 # Option 2b: Docker Hub with real infrastructure (RDS, ECS, Lambda containers)
 docker run -p 4566:4566 -v /var/run/docker.sock:/var/run/docker.sock ministackorg/ministack
+
+# Option 2c: REAL INFRASTRUCTURE FORK — requires Docker socket for containers
+docker run -p 4566:4566 -v /var/run/docker.sock:/var/run/docker.sock b-iurea/ministack:real-infra
 
 # Option 2c: Full image — Debian/glibc base with DuckDB (Athena), psycopg2, pymysql.
 # Larger (~360 MB vs ~110 MB) but enables Athena and native PostgreSQL/MySQL drivers
@@ -336,6 +350,24 @@ subnet = ec2.create_subnet(
 ```
 
 ---
+
+## Real Infrastructure (Fork Only)
+
+This fork replaces mock services with real Docker containers:
+
+| Service | Real Implementation |
+|---|---|
+| **EC2** | Alpine Linux container per instance, real Docker network IP |
+| **EKS** | Multi-node k3s cluster — `kubectl get nodes` shows real workers |
+| **EKS Node Groups** | Each worker is a k3s agent container + EC2 instance |
+| **VPC** | Docker bridge network with CIDR, real cross-VPC isolation |
+| **Lambda** | Docker warm pool (already in upstream) |
+| **RDS** | PostgreSQL/MySQL/MariaDB containers (already in upstream) |
+| **ElastiCache** | Redis/Memcached containers (already in upstream) |
+
+⚠️ Each resource = one Docker container. Memory/CPU scales with resources, not the ~30MB idle of upstream.
+
+**Requirements:** Docker socket mounted (`-v /var/run/docker.sock:/var/run/docker.sock`).
 
 ## Supported Services
 
