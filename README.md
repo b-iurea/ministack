@@ -41,6 +41,40 @@
 > This is just a fun experiment. **Zero risk, zero warranty, pure vibes.** Use the upstream
 > for anything serious. Star the original repo. Support open source. 🫡
 
+## 🍴 Fork Features (vs upstream)
+
+This fork replaces mock/in-memory implementations with **real infrastructure**:
+
+### Tier 1 — Completed ✅
+
+| Feature | Upstream | This Fork |
+|---|---|---|
+| **EC2 Instances** | Mock API responses | Alpine Linux Docker containers with real networking |
+| **EKS Clusters** | Mock | Multi-node k3s Kubernetes (master + worker containers) |
+| **VPCs** | Mock | Isolated Docker bridge networks with real CIDR allocation |
+| **Security Groups** | In-memory rules only | Real iptables rules enforced inside containers (`NET_ADMIN`) |
+| **Multi-region** | Single namespace | `AccountRegionScopedDict` — resources isolated per (account, region) |
+
+### SG → iptables details
+
+- `AuthorizeSecurityGroupIngress/Egress` → `docker exec iptables -A MINISTACK_IN/OUT`
+- `RevokeSecurityGroupIngress/Egress` → rules removed, chain rebuilt
+- `ModifyInstanceAttribute` (Groups) → swaps SGs at runtime, re-applies iptables
+- `UserIdGroupPairs` → resolved to referenced SG's VPC CIDR for cross-instance rules
+- Stateful: `ESTABLISHED,RELATED` conntrack for response traffic
+- Multiple SGs per instance: additive (all rules accumulated)
+
+### Tier 1 — Roadmap 🚧
+
+| Feature | Plan |
+|---|---|
+| **ALB/ELB** | Traefik reverse proxy |
+| **API Gateway** | HTTP proxy with path-based routing |
+| **S3** | MinIO container (real S3-compatible storage) |
+| **CloudWatch Logs** | Filesystem-backed log groups |
+
+---
+
 ## Why MiniStack?
 
 LocalStack recently moved its core services behind a paid plan. If you relied on LocalStack Community for local development and CI/CD pipelines, MiniStack is your free alternative.
