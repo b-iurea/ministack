@@ -41,6 +41,44 @@
 > This is just a fun experiment. **Zero risk, zero warranty, pure vibes.** Use the upstream
 > for anything serious. Star the original repo. Support open source. 🫡
 
+## 🍴 Fork Features (vs upstream)
+
+This fork replaces mock/in-memory implementations with **real infrastructure**.
+
+### Completed ✅
+
+| Feature | Upstream | This Fork |
+|---|---|---|
+| **EC2 Instances** | Mock API | Alpine Linux Docker containers, real networking, `docker exec` shell |
+| **EKS Clusters** | Mock | Multi-node k3s Kubernetes (master + workers), real `kubectl` |
+| **VPCs** | Mock | Isolated Docker bridge networks, real CIDR, cross-VPC isolation |
+| **Security Groups** | In-memory rules | Real **iptables** inside containers (`NET_ADMIN`), stateful conntrack |
+| **Multi-region** | Single namespace | `AccountRegionScopedDict` — resources per (account, region) |
+| **SG live swap** | N/A | `ModifyInstanceAttribute` → swap SGs at runtime, re-apply iptables |
+
+### SG → iptables
+
+```bash
+AuthorizeSecurityGroupIngress → docker exec iptables -A MINISTACK_IN -s 10.1.0.0/16 -p icmp -j ACCEPT
+RevokeSecurityGroupIngress  → chain rebuild without the revoked rule
+UserIdGroupPairs             → resolved to referenced SG's VPC CIDR
+Multiple SGs                 → additive (all rules accumulated)
+Egress revocation            → creates MINISTACK_OUT chain with DROP default
+```
+
+### Roadmap
+
+See [ROADMAP.md](./ROADMAP.md) for the full 67-service real-infrastructure plan.
+
+| Step | Feature | Status |
+|---|---|---|
+| 🔴 Step 3 | **IAM reale** — users, roles, access keys, policy engine, IMDS | Planned |
+| 🟠 Step 4 | **S3 → MinIO** — real S3-compatible storage, versioning | Planned |
+| 🟡 Step 5 | **Networking completo** — IGW, NAT, peering, route tables | Planned |
+| 🟢 Step 6 | **ALB/ELB → Traefik** — reverse proxy, listener rules, TLS | Planned |
+
+---
+
 ## Why MiniStack?
 
 LocalStack recently moved its core services behind a paid plan. If you relied on LocalStack Community for local development and CI/CD pipelines, MiniStack is your free alternative.
