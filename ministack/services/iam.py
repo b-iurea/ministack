@@ -35,6 +35,12 @@ import time
 from urllib.parse import parse_qs
 from urllib.parse import quote as _url_quote
 
+try:
+    import bcrypt
+    _bcrypt_available = True
+except ImportError:
+    _bcrypt_available = False
+
 from ministack.core.responses import AccountScopedDict, get_account_id, get_region, json_response, new_uuid
 
 logger = logging.getLogger("iam")
@@ -913,6 +919,40 @@ def _list_attached_user_policies(p):
 
 # -------------------- Access keys --------------------
 
+# Feature flag: set IAM_ENFORCE=1 to require valid SigV4 signatures.
+_IAM_ENFORCE = os.environ.get("IAM_ENFORCE", "0").strip().lower() in ("1", "true", "yes")
+
+
+def _hash_secret(secret: str) -> str:
+    """Hash a secret access key with bcrypt. Falls back to plaintext if bcrypt unavailable."""
+    if _bcrypt_available:
+        return bcrypt.hashpw(secret.encode(), bcrypt.gensalt()).decode()
+    return secret
+
+
+def _check_secret(secret: str, stored: str) -> bool:
+    """Check a plaintext secret against a stored (possibly hashed) value."""
+    if stored.startswith("$2b$") or stored.startswith("$2a$") or stored.startswith("$2y$"):
+        if _bcrypt_available:
+            return bcrypt.checkpw(secret.encode(), stored.encode())
+        return False
+    # Plaintext fallback (legacy keys created before bcrypt was added)
+    return secret == stored
+
+
+def _validate_access_key(access_key_id: str, secret_access_key: str) -> dict | None:
+    """Validate an access key. Returns the key record dict on success, None on failure."""
+    key = _access_keys.get(access_key_id)
+    if not key:
+        return None
+    if key.get("Status") != "Active":
+        return None
+    stored_secret = key.get("SecretAccessKey", "")
+    if _check_secret(secret_access_key, stored_secret):
+        return dict(key)  # return a copy to avoid mutation
+    return None
+
+
 def _create_access_key(p):
     user_name = _p(p, "UserName")
     if not user_name:
@@ -925,10 +965,11 @@ def _create_access_key(p):
     _access_keys[key_id] = {
         "UserName": user_name,
         "AccessKeyId": key_id,
-        "SecretAccessKey": secret,
+        "SecretAccessKey": _hash_secret(secret),  # store hashed
         "Status": "Active",
         "CreateDate": _now(),
     }
+    # Return the PLAINTEXT secret — this is the ONLY time it's visible
     return _xml(200, "CreateAccessKeyResponse",
                 f"<CreateAccessKeyResult><AccessKey>"
                 f"<UserName>{user_name}</UserName>"
