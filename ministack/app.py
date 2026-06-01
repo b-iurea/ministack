@@ -462,6 +462,63 @@ async def _read_request_body(receive, method: str, headers: dict) -> bytes:
     return _decode_aws_chunked_body(body, headers)
 
 
+async def _enforce_sigv4(method: str, path: str, query_string: str,
+                         headers: dict, body: bytes):
+    """Validate SigV4 signature when IAM_ENFORCE=1."""
+    iam_enforce = os.environ.get("IAM_ENFORCE", "0").strip().lower() in ("1", "true", "yes")
+    if not iam_enforce:
+        return None
+
+    auth_header = headers.get("authorization", "")
+    if not auth_header or not auth_header.startswith("AWS4-HMAC-SHA256"):
+        return None
+
+    from ministack.core import sigv4
+    parsed = sigv4.parse_authorization(auth_header)
+    if not parsed:
+        return _sigv4_error("InvalidClientTokenId", "The security token included in the request is invalid.")
+
+    # Load IAM state and look up the secret
+    from ministack.services.iam import _access_keys
+    key_record = _access_keys.get(parsed["access_key"])
+    if not key_record:
+        # Unknown key — pass through for backward compatibility
+        # (default ministack behaviour: any key works as the default account)
+        return None
+    if key_record.get("Status") != "Active":
+        return _sigv4_error("InvalidClientTokenId", "The security token included in the request is invalid.")
+
+    secret = key_record.get("SecretAccessKey", "")
+    if not secret:
+        return _sigv4_error("InvalidClientTokenId", "The security token included in the request is invalid.")
+
+    # Verify the signature
+    logger.debug("SigV4 verify: method=%s path=%s qs=%s header_keys=%s signed=%s",
+                 method, path, query_string[:100], list(headers.keys())[:10], parsed["signed_headers"])
+    if not sigv4.verify_signature(secret, parsed, method, path, query_string, headers, body):
+        amz_date = headers.get("x-amz-date", "")
+        from ministack.core.sigv4 import _canonical_request, _string_to_sign
+        cr = _canonical_request(method, path, query_string, headers, parsed["signed_headers"], body)
+        sts = _string_to_sign(amz_date, parsed["date"], parsed["region"], parsed["service"], cr)
+        expected = sigv4.compute_signature(secret, parsed["date"], parsed["region"], parsed["service"],
+                                            method, path, query_string, headers, parsed["signed_headers"], body,
+                                            amz_date=amz_date)
+        logger.warning("SigV4 mismatch key=%s expected=%s got=%s\n  STS: %s",
+                       parsed["access_key"][:8], expected[:16], parsed["signature"][:16], sts[:200])
+        return _sigv4_error("SignatureDoesNotMatch",
+                           "The request signature we calculated does not match the signature you provided.")
+
+    return None
+
+
+def _sigv4_error(code: str, message: str):
+    return (
+        403,
+        {"Content-Type": "application/json"},
+        json.dumps({"__type": code, "message": message}).encode(),
+    )
+
+
 async def _send_response(send, status, headers, body):
     """Send ASGI HTTP response."""
 
@@ -1635,6 +1692,10 @@ async def app(scope, receive, send):
         return
 
     body = await _read_request_body(receive, method, headers)
+
+    # SigV4 enforcement (when IAM_ENFORCE=1)
+    if await _send_if_handled(send, await _enforce_sigv4(method, path, query_string, headers, body)):
+        return
 
     if await _send_if_handled(send, await _handle_post_body_shortcuts(method, path, headers, body, query_params, request_id)):
         return

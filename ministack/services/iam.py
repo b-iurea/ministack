@@ -35,12 +35,6 @@ import time
 from urllib.parse import parse_qs
 from urllib.parse import quote as _url_quote
 
-try:
-    import bcrypt
-    _bcrypt_available = True
-except ImportError:
-    _bcrypt_available = False
-
 from ministack.core.responses import AccountScopedDict, get_account_id, get_region, json_response, new_uuid
 
 logger = logging.getLogger("iam")
@@ -923,34 +917,46 @@ def _list_attached_user_policies(p):
 _IAM_ENFORCE = os.environ.get("IAM_ENFORCE", "0").strip().lower() in ("1", "true", "yes")
 
 
-def _hash_secret(secret: str) -> str:
-    """Hash a secret access key with bcrypt. Falls back to plaintext if bcrypt unavailable."""
-    if _bcrypt_available:
-        return bcrypt.hashpw(secret.encode(), bcrypt.gensalt()).decode()
-    return secret
+def _bootstrap_admin():
+    """Create a default admin user when IAM_ENFORCE=1 so clients can get started."""
+    if not _IAM_ENFORCE:
+        return
+    if "admin" in _users:
+        return
+    import string as _string, random as _random, time as _time
+    now = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())
+    uid = "AIDA" + "".join(_random.choices(_string.ascii_uppercase + _string.digits, k=17))
+    _users["admin"] = {
+        "Arn": f"arn:aws:iam::{get_account_id()}:user/admin",
+        "UserId": uid,
+        "UserName": "admin",
+        "CreateDate": now,
+        "Path": "/",
+        "AttachedPolicies": [],
+        "InlinePolicies": {},
+        "Tags": [],
+    }
+    key_id = "AKIA" + "".join(_random.choices(_string.ascii_uppercase + _string.digits, k=16))
+    secret = new_uuid().replace("-", "") + new_uuid().replace("-", "")[:8]
+    _access_keys[key_id] = {
+        "UserName": "admin",
+        "AccessKeyId": key_id,
+        "SecretAccessKey": secret,
+        "Status": "Active",
+        "CreateDate": now,
+    }
+    logger.info("IAM bootstrap: created admin user (key=%s secret=%s)", key_id, secret)
 
 
-def _check_secret(secret: str, stored: str) -> bool:
-    """Check a plaintext secret against a stored (possibly hashed) value."""
-    if stored.startswith("$2b$") or stored.startswith("$2a$") or stored.startswith("$2y$"):
-        if _bcrypt_available:
-            return bcrypt.checkpw(secret.encode(), stored.encode())
-        return False
-    # Plaintext fallback (legacy keys created before bcrypt was added)
-    return secret == stored
+_bootstrap_admin()
 
 
-def _validate_access_key(access_key_id: str, secret_access_key: str) -> dict | None:
-    """Validate an access key. Returns the key record dict on success, None on failure."""
+def _validate_access_key(access_key_id: str) -> dict | None:
+    """Look up an access key. Returns the key record dict on success, None if not found/inactive."""
     key = _access_keys.get(access_key_id)
-    if not key:
+    if not key or key.get("Status") != "Active":
         return None
-    if key.get("Status") != "Active":
-        return None
-    stored_secret = key.get("SecretAccessKey", "")
-    if _check_secret(secret_access_key, stored_secret):
-        return dict(key)  # return a copy to avoid mutation
-    return None
+    return dict(key)
 
 
 def _create_access_key(p):
@@ -965,11 +971,11 @@ def _create_access_key(p):
     _access_keys[key_id] = {
         "UserName": user_name,
         "AccessKeyId": key_id,
-        "SecretAccessKey": _hash_secret(secret),  # store hashed
+        "SecretAccessKey": secret,  # plaintext — SigV4 needs the actual secret
         "Status": "Active",
         "CreateDate": _now(),
     }
-    # Return the PLAINTEXT secret — this is the ONLY time it's visible
+    # Return the secret — this is the ONLY time it's visible
     return _xml(200, "CreateAccessKeyResponse",
                 f"<CreateAccessKeyResult><AccessKey>"
                 f"<UserName>{user_name}</UserName>"
