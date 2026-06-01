@@ -23,6 +23,7 @@ import time
 
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     apply_image_prefix,
     error_response_json,
@@ -50,10 +51,10 @@ except ImportError:
 # State
 # ---------------------------------------------------------------------------
 
-_clusters = AccountScopedDict()       # name -> cluster record
-_nodegroups = AccountScopedDict()     # "cluster/nodegroup" -> nodegroup record
-_addons = AccountScopedDict()         # "cluster/addonName" -> addon record
-_tags = AccountScopedDict()           # arn -> {key: value}
+_clusters = AccountRegionScopedDict()       # name -> cluster record
+_nodegroups = AccountRegionScopedDict()     # "cluster/nodegroup" -> nodegroup record
+_addons = AccountRegionScopedDict()         # "cluster/addonName" -> addon record
+_tags = AccountRegionScopedDict()           # arn -> {key: value}
 _port_counter_lock = threading.Lock()
 _port_counter = [EKS_BASE_PORT]
 _oidc_keypair_lock = threading.Lock()
@@ -455,8 +456,57 @@ def _delete_cluster(name):
 
 # ---------------------------------------------------------------------------
 # Nodegroups
-# ---------------------------------------------------------------------------
+def _k3s_agent_run_kwargs(name: str, ng_name: str, server_url: str, token: str, ms_network: str | None = None) -> dict:
+    """Build docker run kwargs for a k3s agent (worker node) container."""
+    run_kwargs = dict(
+        image=apply_image_prefix(EKS_K3S_IMAGE),
+        command=["agent",
+                 f"--server={server_url}",
+                 f"--token={token}"],
+        detach=True,
+        privileged=True,
+        cap_add=["SYS_ADMIN", "NET_ADMIN", "NET_RAW", "NET_BIND_SERVICE",
+                 "SYS_PTRACE", "SYS_RESOURCE", "SYS_CHROOT",
+                 "DAC_OVERRIDE", "FSETID", "CHOWN", "MKNOD",
+                 "KILL", "SETGID", "SETUID", "SETPCAP", "SETFCAP"],
+        security_opt=["seccomp=unconfined", "apparmor=unconfined"],
+        name=f"ministack-eks-{name}-worker-{ng_name}-{new_uuid()[:8]}",
+        labels={"ministack": "eks", "cluster_name": name, "nodegroup": ng_name},
+        tmpfs={"/run": "", "/var/run": "", "/tmp": ""},
+        volumes={"/lib/modules": {"bind": "/lib/modules", "mode": "ro"}},
+    )
+    if ms_network:
+        run_kwargs["network"] = ms_network
+    return run_kwargs
 
+
+def _get_master_token(container):
+    """Extract the k3s node token from a running server container."""
+    try:
+        _, output = container.exec_run("cat /var/lib/rancher/k3s/server/node-token")
+        return output.decode("utf-8", errors="replace").strip()
+    except Exception:
+        return ""
+
+
+def _stop_nodegroup_containers(cluster_name: str, ng_name: str):
+    """Stop all k3s agent containers belonging to a nodegroup."""
+    client = _get_docker()
+    if not client:
+        return
+    try:
+        for c in client.containers.list(filters={"label": [
+            "ministack=eks",
+            f"cluster_name={cluster_name}",
+            f"nodegroup={ng_name}",
+        ]}):
+            try:
+                c.stop(timeout=5)
+                c.remove(v=True, force=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
 def _create_nodegroup(cluster_name, body):
     if cluster_name not in _clusters:
         return _error(404, "ResourceNotFoundException", f"No cluster found for name: {cluster_name}.")
@@ -503,6 +553,88 @@ def _create_nodegroup(cluster_name, body):
     if nodegroup["tags"]:
         _tags[arn] = dict(nodegroup["tags"])
 
+    # Spawn real k3s agent containers (worker nodes)
+    cluster = _clusters[cluster_name]
+    desired = scaling.get("desiredSize", 1)
+    container_id = cluster.get("_docker_id")
+
+    def _bg_spawn_agents():
+        client = _get_docker()
+        if not client or not container_id:
+            return
+        try:
+            master = client.containers.get(container_id)
+            token = _get_master_token(master)
+            if not token:
+                logger.warning("EKS: could not get master token for %s, skipping agents", cluster_name)
+                return
+            ms_network = _get_ministack_network(client)
+            server_ip = ""
+            if ms_network:
+                master.reload()
+                nets = master.attrs.get("NetworkSettings", {}).get("Networks", {})
+                server_ip = nets.get(ms_network, {}).get("IPAddress", "")
+            server_url = f"https://{server_ip}:6443" if server_ip else f"https://localhost:{cluster['_port']}"
+
+            # Lazy import to avoid circular dependency at module load
+            import ministack.services.ec2 as _ec2
+
+            for i in range(desired):
+                agent_kwargs = _k3s_agent_run_kwargs(cluster_name, ng_name, server_url, token, ms_network)
+                container = client.containers.run(**agent_kwargs)
+                logger.info("EKS: spawned k3s agent %d/%d for nodegroup %s/%s", i + 1, desired, cluster_name, ng_name)
+
+                # Register this worker as an EC2 instance so it appears in describe_instances
+                instance_id = _ec2._new_instance_id()
+                private_ip = ""
+                if ms_network:
+                    container.reload()
+                    nets = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+                    private_ip = nets.get(ms_network, {}).get("IPAddress", "")
+                if not private_ip:
+                    private_ip = _ec2._random_ip("10.0.")
+                now = _ec2._now_ts()
+                _ec2._instances[instance_id] = {
+                    "InstanceId": instance_id,
+                    "ImageId": "ami-eks-worker",
+                    "InstanceType": scaling.get("instanceTypes", ["t3.medium"])[0] if scaling.get("instanceTypes") else "t3.medium",
+                    "KeyName": "",
+                    "State": {"Code": 16, "Name": "running"},
+                    "SubnetId": body.get("subnets", ["subnet-00000001"])[0],
+                    "VpcId": cluster.get("resourcesVpcConfig", {}).get("vpcId", "vpc-00000000"),
+                    "PrivateIpAddress": private_ip,
+                    "PublicIpAddress": _ec2._random_ip("54."),
+                    "PrivateDnsName": f"ip-{private_ip.replace('.','-')}.ec2.internal",
+                    "PublicDnsName": "",
+                    "SecurityGroups": [{"GroupId": "sg-00000001", "GroupName": "default"}],
+                    "Architecture": "x86_64",
+                    "RootDeviceType": "ebs",
+                    "RootDeviceName": "/dev/xvda",
+                    "Hypervisor": "nitro",
+                    "Virtualization": "hvm",
+                    "Placement": {"AvailabilityZone": f"{get_region()}a", "Tenancy": "default"},
+                    "Monitoring": {"State": "disabled"},
+                    "AmiLaunchIndex": i,
+                    "LaunchTime": now,
+                    "BlockDeviceMappings": [],
+                    "Tags": [{"Key": "Name", "Value": f"{cluster_name}-{ng_name}-{i+1}"},
+                             {"Key": "eks:cluster-name", "Value": cluster_name},
+                             {"Key": "eks:nodegroup-name", "Value": ng_name},
+                             {"Key": "aws:autoscaling:groupName", "Value": f"eks-{ng_name}"}],
+                    "_docker_id": container.id,
+                }
+                if instance_id not in _ec2._tags:
+                    _ec2._tags[instance_id] = [
+                        {"Key": "Name", "Value": f"{cluster_name}-{ng_name}-{i+1}"},
+                        {"Key": "eks:cluster-name", "Value": cluster_name},
+                        {"Key": "eks:nodegroup-name", "Value": ng_name},
+                        {"Key": "aws:autoscaling:groupName", "Value": f"eks-{ng_name}"},
+                    ]
+        except Exception as e:
+            logger.warning("EKS: failed to spawn agents for %s/%s: %s", cluster_name, ng_name, e)
+
+    threading.Thread(target=_bg_spawn_agents, daemon=True, name=f"eks-agents-{cluster_name}-{ng_name}").start()
+
     return _json_resp(200, {"nodegroup": nodegroup})
 
 
@@ -534,6 +666,23 @@ def _delete_nodegroup(cluster_name, ng_name):
     result = dict(ng)
     _nodegroups.pop(key, None)
     _tags.pop(ng.get("nodegroupArn", ""), None)
+
+    # Stop agent containers AND remove EC2 instance records in background
+    def _bg_stop():
+        import ministack.services.ec2 as _ec2
+        # Stop Docker containers
+        _stop_nodegroup_containers(cluster_name, ng_name)
+        # Remove EC2 instance records for workers from this nodegroup
+        to_delete = [iid for iid, inst in _ec2._instances.items()
+                     if any(t.get("Key") == "eks:nodegroup-name" and t.get("Value") == ng_name
+                            for t in (inst.get("Tags") or []))]
+        for iid in to_delete:
+            inst = _ec2._instances.pop(iid, None)
+            if inst:
+                _ec2._tags.pop(iid, None)
+                logger.info("EKS: removed EC2 instance record %s for nodegroup %s", iid, ng_name)
+    threading.Thread(target=_bg_stop, daemon=True, name=f"eks-del-{cluster_name}-{ng_name}").start()
+
     return _json_resp(200, {"nodegroup": result})
 
 
