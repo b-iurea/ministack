@@ -108,22 +108,17 @@ def _spawn_instance(instance_id: str, private_ip: str, subnet_id: str, tags: lis
             break
     container_name = f"ministack-ec2-{instance_id}{name_tag}"[:255]
 
-    # Try to place on the same Docker network as MiniStack
-    network = EC2_DOCKER_NETWORK
-    if not network:
-        try:
-            hostname = os.environ.get("HOSTNAME", "")
-            if hostname:
-                self_c = client.containers.get(hostname)
-                nets = list(self_c.attrs["NetworkSettings"]["Networks"].keys())
-                network = nets[0] if nets else None
-        except Exception:
-            pass
+    # Find the VPC network this instance belongs to
+    subnet = _subnets.get(subnet_id, {})
+    vpc_id = subnet.get("VpcId", _DEFAULT_VPC_ID)
+    network_name = _vpc_network_name(vpc_id)
+    network = _ensure_vpc_network(vpc_id)
 
     env_vars = {
         "MINISTACK_INSTANCE_ID": instance_id,
         "MINISTACK_PRIVATE_IP": private_ip,
         "MINISTACK_SUBNET_ID": subnet_id,
+        "MINISTACK_VPC_ID": vpc_id,
     }
 
     try:
@@ -132,7 +127,7 @@ def _spawn_instance(instance_id: str, private_ip: str, subnet_id: str, tags: lis
             command=["sleep", "infinity"],
             detach=True,
             name=container_name,
-            labels={"ministack": "ec2", "instance_id": instance_id},
+            labels={"ministack": "ec2", "instance_id": instance_id, "vpc_id": vpc_id},
             environment=env_vars,
             hostname=f"ip-{private_ip.replace('.', '-')}.ec2.internal",
         )
@@ -140,11 +135,61 @@ def _spawn_instance(instance_id: str, private_ip: str, subnet_id: str, tags: lis
             run_kwargs["network"] = network
 
         container = client.containers.run(**run_kwargs)
-        logger.info("EC2: spawned container %s for instance %s (ip=%s)", container.id[:12], instance_id, private_ip)
+        logger.info("EC2: spawned container %s for instance %s (ip=%s vpc=%s)", container.id[:12], instance_id, private_ip, vpc_id)
         return container.id
     except Exception as e:
         logger.warning("EC2: failed to spawn container for %s: %s", instance_id, e)
         return None
+
+
+def _vpc_network_name(vpc_id: str) -> str:
+    """Docker network name for a VPC."""
+    return f"vpc-{vpc_id}"
+
+
+def _ensure_vpc_network(vpc_id: str) -> str | None:
+    """Get or create the Docker network for a VPC. Returns network ID or None."""
+    client = _get_docker()
+    if not client:
+        return None
+    net_name = _vpc_network_name(vpc_id)
+    try:
+        # Check if network already exists
+        for net in client.networks.list(names=[net_name]):
+            return net_name
+    except Exception:
+        pass
+
+    # Create the network
+    vpc = _vpcs.get(vpc_id, {})
+    cidr = vpc.get("CidrBlock", "10.0.0.0/16")
+    try:
+        client.networks.create(
+            name=net_name,
+            driver="bridge",
+            ipam={"Driver": "default", "Config": [{"Subnet": cidr}]},
+            labels={"ministack": "vpc", "vpc_id": vpc_id},
+            check_duplicate=True,
+        )
+        logger.info("VPC: created Docker network %s for VPC %s (%s)", net_name, vpc_id, cidr)
+        return net_name
+    except Exception as e:
+        logger.warning("VPC: failed to create Docker network for %s: %s", vpc_id, e)
+        return None
+
+
+def _remove_vpc_network(vpc_id: str):
+    """Remove the Docker network for a VPC."""
+    client = _get_docker()
+    if not client:
+        return
+    net_name = _vpc_network_name(vpc_id)
+    try:
+        for net in client.networks.list(names=[net_name]):
+            net.remove()
+            logger.info("VPC: removed Docker network %s for VPC %s", net_name, vpc_id)
+    except Exception as e:
+        logger.warning("VPC: failed to remove Docker network for %s: %s", vpc_id, e)
 
 
 def _stop_instance(instance_id: str):
@@ -1128,6 +1173,12 @@ def _create_vpc(p):
         "DefaultSecurityGroupId": sg_id, "MainRouteTableId": rtb_id,
     }
     _parse_tag_specs(p, "vpc", vpc_id)
+
+    # Create the real Docker network for this VPC (background)
+    def _bg_net():
+        _ensure_vpc_network(vpc_id)
+    threading.Thread(target=_bg_net, daemon=True, name=f"vpc-net-{vpc_id}").start()
+
     return _xml(200, "CreateVpcResponse", _vpc_fields_xml(_vpcs[vpc_id], tag="vpc"))
 
 
@@ -1162,6 +1213,12 @@ def _delete_vpc(p):
     for aid in to_del_acl:
         del _network_acls[aid]
     del _vpcs[vpc_id]
+
+    # Remove the Docker network for this VPC
+    def _bg_rm():
+        _remove_vpc_network(vpc_id)
+    threading.Thread(target=_bg_rm, daemon=True, name=f"vpc-rm-{vpc_id}").start()
+
     return _xml(200, "DeleteVpcResponse", "<return>true</return>")
 
 
