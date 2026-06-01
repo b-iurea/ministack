@@ -4,7 +4,8 @@
 
 | Repo | Branch | Status |
 |---|---|---|
-| ministack | `feat/real-infra-step1-vpc` | Active |
+| ministack | `feat/real-infra-step2-sg-iptables` | **Active — implementing** |
+| ministack | `feat/real-infra-step1-vpc` | Merged into step2 |
 | ministack-dashboard | `feat/resource-detail-modal` | Active |
 | ministack | `feat/region-isolation` | PR aperta su fork |
 | ministack | `feat/real-containers` | Merged into step1 |
@@ -86,11 +87,18 @@
 
 ## Next Steps — Real Infrastructure Roadmap
 
+### ✅ Security Group → iptables (`feat/real-infra-step2-sg-iptables`)
+- iptables rules applied inside EC2 containers via `docker exec`
+- `_iptables_build_commands` translates SG IpPermissions → iptables ACCEPT/DROP
+- Custom chains: `MINISTACK_IN` (ingress), `MINISTACK_OUT` (egress)
+- Stateful: `ESTABLISHED,RELATED` conntrack for response traffic
+- Authorize / revoke propagate changes to all running instances (background thread)
+- Loopback allowed; default DROP inbound; default ACCEPT outbound
+- IPv6 support via `ip6tables`
+- **Verified:** unit tests for proto mapping, port matching, multi-SG aggregation
+
 ### Tier 1 — High Impact
-1. **Security Group → iptables**
-   - Apply iptables rules on EC2/EKS containers
-   - Ingress/egress = ACCEPT/DROP
-   - Real traffic blocking
+1. ~~**Security Group → iptables**~~ ✅ DONE
 
 2. **ALB/ELB → Traefik**
    - Container Traefik for reverse proxy
