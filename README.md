@@ -27,9 +27,19 @@
 > - **EC2** instances = Alpine Linux containers with real networking
 > - **EKS** clusters = multi-node k3s Kubernetes with real worker nodes
 > - **VPCs** = isolated Docker bridge networks with real cross-VPC isolation
-> - **🚫 NOT the upstream MiniStack.** Use only if you need real infrastructure.
-> - **⚠️ Larger footprint** — each resource spawns a container. Not the ~30MB idle of upstream.
-> - **Upstream:** [ministackorg/ministack](https://github.com/ministackorg/ministack)
+>
+> **🚫 NOT the upstream MiniStack.** Use only if you need real infrastructure.
+> **⚠️ Larger footprint** — each resource spawns a container. Not the ~30MB idle of upstream.
+> **Upstream:** [ministackorg/ministack](https://github.com/ministackorg/ministack)
+>
+> ---
+>
+> 💙 **Thank you to the MiniStack team** for building an incredible open-source AWS emulator.
+> This fork is **vibecoded** — hacked together with AI, untested in production, held together by
+> hope and Docker sockets. The real [MiniStack](https://github.com/ministackorg/ministack) is
+> always better, more stable, and actually maintained by humans who know what they're doing.
+> This is just a fun experiment. **Zero risk, zero warranty, pure vibes.** Use the upstream
+> for anything serious. Star the original repo. Support open source. 🫡
 
 ## Why MiniStack?
 
