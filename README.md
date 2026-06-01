@@ -70,7 +70,7 @@ docker run -p 4566:4566 ministackorg/ministack
 docker run -p 4566:4566 -v /var/run/docker.sock:/var/run/docker.sock ministackorg/ministack
 
 # Option 2c: REAL INFRASTRUCTURE FORK — requires Docker socket for containers
-docker run -p 4566:4566 -v /var/run/docker.sock:/var/run/docker.sock b-iurea/ministack:real-infra
+docker run -p 4566:4566 -v /var/run/docker.sock:/var/run/docker.sock bogdaniurea/ministack:real-infra
 
 # Option 2c: Full image — Debian/glibc base with DuckDB (Athena), psycopg2, pymysql.
 # Larger (~360 MB vs ~110 MB) but enables Athena and native PostgreSQL/MySQL drivers
