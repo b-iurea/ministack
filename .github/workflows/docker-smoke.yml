@@ -1,0 +1,43 @@
+name: Docker Smoke
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-smoke-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t ministack:ci .
+
+      - name: Start container
+        run: docker run -d --name ministack-smoke -p 4566:4566 ministack:ci
+
+      - name: Wait for health endpoint
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:4566/_ministack/health > /tmp/ministack-health.json; then
+              echo "Container is healthy after ${i}s"
+              cat /tmp/ministack-health.json
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "MiniStack container did not become healthy within 60s" >&2
+          docker logs ministack-smoke || true
+          exit 1
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f ministack-smoke
