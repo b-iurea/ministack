@@ -55,6 +55,32 @@ This fork replaces mock/in-memory implementations with **real infrastructure**.
 | **Security Groups** | In-memory rules | Real **iptables** inside containers (`NET_ADMIN`), stateful conntrack |
 | **Multi-region** | Single namespace | `AccountRegionScopedDict` — resources per (account, region) |
 | **SG live swap** | N/A | `ModifyInstanceAttribute` → swap SGs at runtime, re-apply iptables |
+| **IAM Identity & Access** | Mock, any key works | Real access keys with **SigV4 validation** (`IAM_ENFORCE=1`) |
+| **IAM Policy Engine** | Always "allowed" | Real Allow/Deny/ImplicitDeny evaluation, wildcard matching |
+| **STS AssumeRole** | Mock credentials | Validates IAM roles, generates session keys validated by SigV4 |
+
+### IAM → SigV4 enforcement
+
+```bash
+IAM_ENFORCE=1  # activate (default 0 = backward compatible)
+
+# Bootstrap admin auto-created on startup
+AdminKey=$(docker logs ministack | grep "bootstrap:" | grep -oP 'key=\K[A-Z0-9]+')
+AdminSecret=$(docker logs ministack | grep "bootstrap:" | grep -oP 'secret=\K[a-f0-9]+')
+
+# Real SigV4 validation
+export AWS_ACCESS_KEY_ID=$AdminKey
+export AWS_SECRET_ACCESS_KEY=$AdminSecret
+aws --endpoint-url http://localhost:4566 iam create-user --user-name bob  ✅
+export AWS_SECRET_ACCESS_KEY=wrong
+aws --endpoint-url http://localhost:4566 iam get-user --user-name bob   ❌ SignatureDoesNotMatch
+
+# AssumeRole with real credentials
+aws --endpoint-url http://localhost:4566 sts assume-role \
+  --role-arn arn:aws:iam::000000000000:role/MyRole \
+  --role-session-name test
+# → returns valid session credentials usable with boto3
+```
 
 ### SG → iptables
 
@@ -72,7 +98,7 @@ See [ROADMAP.md](./ROADMAP.md) for the full 67-service real-infrastructure plan.
 
 | Step | Feature | Status |
 |---|---|---|
-| 🔴 Step 3 | **IAM reale** — users, roles, access keys, policy engine, IMDS | Planned |
+| 🔴 Step 3 | **IAM reale** — users, roles, access keys, policy engine, SigV4 | ✅ DONE |
 | 🟠 Step 4 | **S3 → MinIO** — real S3-compatible storage, versioning | Planned |
 | 🟡 Step 5 | **Networking completo** — IGW, NAT, peering, route tables | Planned |
 | 🟢 Step 6 | **ALB/ELB → Traefik** — reverse proxy, listener rules, TLS | Planned |
