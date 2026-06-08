@@ -130,6 +130,7 @@ def _spawn_instance(instance_id: str, private_ip: str, subnet_id: str, tags: lis
             labels={"ministack": "ec2", "instance_id": instance_id, "vpc_id": vpc_id},
             environment=env_vars,
             hostname=f"ip-{private_ip.replace('.', '-')}.ec2.internal",
+            cap_add=["NET_ADMIN", "NET_RAW"],
         )
         if network:
             run_kwargs["network"] = network
@@ -137,18 +138,25 @@ def _spawn_instance(instance_id: str, private_ip: str, subnet_id: str, tags: lis
         container = client.containers.run(**run_kwargs)
         logger.info("EC2: spawned container %s for instance %s (ip=%s vpc=%s)", container.id[:12], instance_id, private_ip, vpc_id)
 
-        # Update the instance record with the REAL Docker-assigned IP
+        # Update the instance record with the REAL Docker-assigned IP.
+        # Prefer the VPC network IP over default bridge.
         inst = _instances.get(instance_id)
         if inst:
             container.reload()
             nets = container.attrs.get("NetworkSettings", {}).get("Networks", {})
-            for net_name, net_conf in nets.items():
+            vpc_net = _vpc_network_name(vpc_id)
+            # Try VPC network first, then fall back to any
+            for net_name in ([vpc_net] + [n for n in nets if n != vpc_net]):
+                net_conf = nets.get(net_name, {})
                 real_ip = net_conf.get("IPAddress", "")
                 if real_ip:
                     inst["PrivateIpAddress"] = real_ip
                     inst["PrivateDnsName"] = f"ip-{real_ip.replace('.', '-')}.ec2.internal"
-                    logger.info("EC2: updated instance %s PrivateIp to %s", instance_id, real_ip)
+                    logger.info("EC2: updated instance %s PrivateIp to %s (net=%s)", instance_id, real_ip, net_name)
                     break
+
+        # Apply security group iptables rules inside the container
+        _iptables_apply(instance_id)
 
         return container.id
     except Exception as e:
@@ -174,22 +182,34 @@ def _ensure_vpc_network(vpc_id: str) -> str | None:
     except Exception:
         pass
 
-    # Create the network
+    # Create the network (may race with another thread — retry on conflict)
     vpc = _vpcs.get(vpc_id, {})
     cidr = vpc.get("CidrBlock", "10.0.0.0/16")
-    try:
-        client.networks.create(
-            name=net_name,
-            driver="bridge",
-            ipam={"Driver": "default", "Config": [{"Subnet": cidr}]},
-            labels={"ministack": "vpc", "vpc_id": vpc_id},
-            check_duplicate=True,
-        )
-        logger.info("VPC: created Docker network %s for VPC %s (%s)", net_name, vpc_id, cidr)
-        return net_name
-    except Exception as e:
-        logger.warning("VPC: failed to create Docker network for %s: %s", vpc_id, e)
-        return None
+    for attempt in range(3):
+        try:
+            client.networks.create(
+                name=net_name,
+                driver="bridge",
+                ipam={"Driver": "default", "Config": [{"Subnet": cidr}]},
+                labels={"ministack": "vpc", "vpc_id": vpc_id},
+                check_duplicate=True,
+            )
+            logger.info("VPC: created Docker network %s for VPC %s (%s)", net_name, vpc_id, cidr)
+            return net_name
+        except Exception as e:
+            err = str(e)
+            if "already exists" in err.lower() or "conflict" in err.lower():
+                # Another thread created it — re-check and return
+                try:
+                    for net in client.networks.list(names=[net_name]):
+                        return net_name
+                except Exception:
+                    pass
+                if attempt < 2:
+                    continue
+            logger.warning("VPC: failed to create Docker network for %s: %s", vpc_id, e)
+            return None
+    return None
 
 
 def _remove_vpc_network(vpc_id: str):
@@ -221,6 +241,222 @@ def _stop_instance(instance_id: str):
                 pass
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Security Group → iptables engine
+# ---------------------------------------------------------------------------
+# When an EC2 container is spawned, its security group rules are enforced as
+# real iptables rules inside the container via ``docker exec``.  Authorize /
+# revoke operations re-apply iptables to every affected container in a
+# background thread so the API stays responsive.
+# ---------------------------------------------------------------------------
+
+_IPTABLES_INSTALLED = set()  # container IDs that already have iptables
+
+
+def _iptables_proto(protocol: str) -> str:
+    """Map an AWS IpProtocol string to an iptables ``-p`` value."""
+    p = (protocol or "-1").strip()
+    if p == "-1":
+        return ""  # all protocols
+    if p == "6":
+        return "-p tcp"
+    if p == "17":
+        return "-p udp"
+    if p == "1":
+        return "-p icmp"
+    if p == "58":
+        return "-p ipv6-icmp"
+    # Try as a name (tcp, udp, icmp, …)
+    return f"-p {p}"
+
+
+def _iptables_port_match(proto: str, from_port, to_port) -> str:
+    """Build ``--dport`` / ``--sport`` fragment for an SG rule."""
+    if from_port is None and to_port is None:
+        return ""
+    proto = (proto or "").strip()
+    # Only TCP/UDP support port matching in iptables
+    if proto not in ("tcp", "udp", "6", "17"):
+        return ""
+    if proto == "6":
+        mod = "tcp"
+    elif proto == "17":
+        mod = "udp"
+    else:
+        mod = proto
+    f = from_port if from_port is not None else to_port
+    t = to_port if to_port is not None else from_port
+    if f == t:
+        return f"-m {mod} --dport {f}"
+    return f"-m {mod} --dport {f}:{t}"
+
+
+def _is_default_allow_all_egress(rule: dict) -> bool:
+    """Return True if *rule* is the AWS-default allow-all-outbound rule."""
+    return (
+        rule.get("IpProtocol", "-1") == "-1"
+        and not rule.get("FromPort")
+        and not rule.get("ToPort")
+        and not rule.get("UserIdGroupPairs")
+        and not rule.get("PrefixListIds")
+        and any(r.get("CidrIp") == "0.0.0.0/0" for r in rule.get("IpRanges", []))
+    )
+
+
+def _iptables_build_commands(instance_id: str) -> list[str]:
+    """Build the shell commands that enforce an instance's security groups."""
+    inst = _instances.get(instance_id)
+    if not inst:
+        return []
+
+    sg_ids = [sg["GroupId"] for sg in inst.get("SecurityGroups", [])]
+    cmds: list[str] = []
+
+    # ── Ingress ──────────────────────────────────────────────────────────
+    # Tear down old chain: remove the INPUT jump, then flush & delete.
+    cmds.append("iptables -D INPUT -j MINISTACK_IN 2>/dev/null || true")
+    cmds.append("iptables -F MINISTACK_IN 2>/dev/null || true")
+    cmds.append("iptables -X MINISTACK_IN 2>/dev/null || true")
+    cmds.append("iptables -N MINISTACK_IN")
+    # Stateful: allow responses to outbound traffic back in
+    cmds.append("iptables -A MINISTACK_IN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT")
+    # Loopback
+    cmds.append("iptables -A MINISTACK_IN -i lo -j ACCEPT")
+
+    for sg_id in sg_ids:
+        sg = _security_groups.get(sg_id)
+        if not sg:
+            continue
+        for rule in sg.get("IpPermissions", []):
+            proto_flag = _iptables_proto(rule.get("IpProtocol", "-1"))
+            port_match = _iptables_port_match(rule.get("IpProtocol", "-1"),
+                                              rule.get("FromPort"),
+                                              rule.get("ToPort"))
+            for cidr in rule.get("IpRanges", []):
+                src = cidr.get("CidrIp", "0.0.0.0/0")
+                match = f"{proto_flag} {port_match}".strip()
+                cmds.append(f"iptables -A MINISTACK_IN -s {src} {match} -j ACCEPT")
+
+            for cidr6 in rule.get("Ipv6Ranges", []):
+                src = cidr6.get("CidrIpv6", "::/0")
+                match = f"{proto_flag} {port_match}".strip()
+                cmds.append(f"ip6tables -A MINISTACK_IN -s {src} {match} -j ACCEPT")
+
+            for pair in rule.get("UserIdGroupPairs", []):
+                ref_sg_id = pair.get("GroupId", "") if isinstance(pair, dict) else str(pair)
+                ref_sg = _security_groups.get(ref_sg_id)
+                if ref_sg:
+                    ref_vpc_id = ref_sg.get("VpcId", "")
+                    ref_vpc = _vpcs.get(ref_vpc_id, {})
+                    ref_cidr = ref_vpc.get("CidrBlock", "")
+                    if ref_cidr:
+                        match = f"{proto_flag} {port_match}".strip()
+                        cmds.append(f"iptables -A MINISTACK_IN -s {ref_cidr} {match} -j ACCEPT")
+
+    # Default DROP for unmatched inbound
+    cmds.append("iptables -A MINISTACK_IN -j DROP")
+    # Insert jump at top of INPUT (skip if already present)
+    cmds.append("iptables -C INPUT -j MINISTACK_IN 2>/dev/null || iptables -I INPUT 1 -j MINISTACK_IN")
+
+    # ── Egress ───────────────────────────────────────────────────────────
+    has_allow_all = False
+    extra_egress: list[dict] = []
+    for sg_id in sg_ids:
+        sg = _security_groups.get(sg_id)
+        if not sg:
+            continue
+        for rule in sg.get("IpPermissionsEgress", []):
+            if _is_default_allow_all_egress(rule):
+                has_allow_all = True
+            else:
+                extra_egress.append(rule)
+
+    # Tear down old egress chain first
+    cmds.append("iptables -D OUTPUT -j MINISTACK_OUT 2>/dev/null || true")
+    cmds.append("iptables -F MINISTACK_OUT 2>/dev/null || true")
+    cmds.append("iptables -X MINISTACK_OUT 2>/dev/null || true")
+
+    if has_allow_all:
+        # Default AWS behaviour: all outbound allowed — chain stays deleted
+        pass
+    else:
+        # User revoked default allow-all → enforce egress restrictions
+        cmds.append("iptables -N MINISTACK_OUT")
+        cmds.append("iptables -A MINISTACK_OUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT")
+        cmds.append("iptables -A MINISTACK_OUT -o lo -j ACCEPT")
+        for rule in extra_egress:
+            proto_flag = _iptables_proto(rule.get("IpProtocol", "-1"))
+            port_match = _iptables_port_match(rule.get("IpProtocol", "-1"),
+                                              rule.get("FromPort"),
+                                              rule.get("ToPort"))
+            for cidr in rule.get("IpRanges", []):
+                dst = cidr.get("CidrIp", "0.0.0.0/0")
+                match = f"{proto_flag} {port_match}".strip()
+                cmds.append(f"iptables -A MINISTACK_OUT -d {dst} {match} -j ACCEPT")
+        cmds.append("iptables -A MINISTACK_OUT -j DROP")
+        cmds.append("iptables -C OUTPUT -j MINISTACK_OUT 2>/dev/null || iptables -I OUTPUT 1 -j MINISTACK_OUT")
+
+    return cmds
+
+
+def _iptables_apply(instance_id: str) -> bool:
+    """Apply iptables rules inside an EC2 container.  Returns True on success."""
+    client = _get_docker()
+    if not client:
+        return False
+    try:
+        containers = client.containers.list(
+            filters={"label": f"instance_id={instance_id}"})
+    except Exception:
+        return False
+    if not containers:
+        return False
+
+    container = containers[0]
+    cid = container.id
+
+    # Install iptables once per container lifetime
+    if cid not in _IPTABLES_INSTALLED:
+        result = container.exec_run(
+            "apk add --no-cache iptables ip6tables")
+        if result.exit_code != 0:
+            logger.warning("EC2: iptables install failed for %s (exit %s): %.200s",
+                           instance_id, result.exit_code,
+                           result.output.decode(errors="replace"))
+            return False
+        _IPTABLES_INSTALLED.add(cid)
+
+    cmds = _iptables_build_commands(instance_id)
+    if not cmds:
+        return True
+
+    script = " && ".join(cmds)
+    result = container.exec_run(f"sh -c '{script}'")
+    if result.exit_code != 0:
+        logger.warning("EC2: iptables apply failed for %s (exit %s): %.200s",
+                       instance_id, result.exit_code,
+                       result.output.decode(errors="replace"))
+        return False
+    logger.info("EC2: iptables applied for instance %s (%d rules)",
+                instance_id, len(cmds))
+    return True
+
+
+def _iptables_propagate(sg_id: str):
+    """Re-apply iptables to every running instance that uses *sg_id*.
+
+    Runs in a background thread so the API call returns immediately.
+    """
+    def _worker():
+        for iid, inst in list(_instances.items()):
+            sg_ids = [sg["GroupId"] for sg in inst.get("SecurityGroups", [])]
+            if sg_id in sg_ids and inst.get("State", {}).get("Name") == "running":
+                _iptables_apply(iid)
+    threading.Thread(target=_worker, daemon=True,
+                     name=f"iptables-prop-{sg_id}").start()
+
 
 logger = logging.getLogger("ec2")
 
@@ -982,6 +1218,7 @@ def _authorize_sg_ingress(p):
             sg["IpPermissions"].append(r)
             idx = len(sg["IpPermissions"]) - 1
             rule_items += _sg_rule_xml(sg_id, r, idx, is_egress=False)
+    _iptables_propagate(sg_id)
     return _xml(200, "AuthorizeSecurityGroupIngressResponse",
                 f"<return>true</return><securityGroupRuleSet>{rule_items}</securityGroupRuleSet>")
 
@@ -994,6 +1231,7 @@ def _revoke_sg_ingress(p):
     rules = _parse_ip_permissions(p, "IpPermissions")
     for r in rules:
         sg["IpPermissions"] = [e for e in sg["IpPermissions"] if not _rules_match(r, e)]
+    _iptables_propagate(sg_id)
     return _xml(200, "RevokeSecurityGroupIngressResponse", "<return>true</return>")
 
 
@@ -1009,6 +1247,7 @@ def _authorize_sg_egress(p):
             sg["IpPermissionsEgress"].append(r)
             idx = len(sg["IpPermissionsEgress"]) - 1
             rule_items += _sg_rule_xml(sg_id, r, idx, is_egress=True)
+    _iptables_propagate(sg_id)
     return _xml(200, "AuthorizeSecurityGroupEgressResponse",
                 f"<return>true</return><securityGroupRuleSet>{rule_items}</securityGroupRuleSet>")
 
@@ -1027,6 +1266,7 @@ def _revoke_sg_egress(p):
         else:
             remaining.append(existing)
     sg["IpPermissionsEgress"] = remaining
+    _iptables_propagate(sg_id)
     return _xml(200, "RevokeSecurityGroupEgressResponse",
                 f"<return>true</return><revokedSecurityGroupRuleSet>{revoked_items}</revokedSecurityGroupRuleSet>")
 
@@ -2844,6 +3084,36 @@ def _parse_ip_permissions(params, prefix):
                 entry["Description"] = desc
             rule["Ipv6Ranges"].append(entry)
             j += 1
+        j = 1
+        while True:
+            # EC2 Query API uses "Groups.N.GroupId" in requests;
+            # REST/JSON clients may send "UserIdGroupPairs.N.GroupId".
+            group_id = (_p(params, f"{prefix}.{i}.Groups.{j}.GroupId")
+                        or _p(params, f"{prefix}.{i}.UserIdGroupPairs.{j}.GroupId"))
+            if not group_id:
+                break
+            entry = {"GroupId": group_id}
+            desc = (_p(params, f"{prefix}.{i}.Groups.{j}.Description")
+                    or _p(params, f"{prefix}.{i}.UserIdGroupPairs.{j}.Description"))
+            if desc:
+                entry["Description"] = desc
+            uid = (_p(params, f"{prefix}.{i}.Groups.{j}.UserId")
+                   or _p(params, f"{prefix}.{i}.UserIdGroupPairs.{j}.UserId"))
+            if uid:
+                entry["UserId"] = uid
+            rule["UserIdGroupPairs"].append(entry)
+            j += 1
+        j = 1
+        while True:
+            pl_id = _p(params, f"{prefix}.{i}.PrefixListIds.{j}.PrefixListId")
+            if not pl_id:
+                break
+            entry = {"PrefixListId": pl_id}
+            desc = _p(params, f"{prefix}.{i}.PrefixListIds.{j}.Description")
+            if desc:
+                entry["Description"] = desc
+            rule["PrefixListIds"].append(entry)
+            j += 1
         rules.append(rule)
         i += 1
     return rules
@@ -4109,6 +4379,33 @@ def reset():
 # Action map
 # ---------------------------------------------------------------------------
 
+def _modify_instance_attribute(p):
+    """Handle ModifyInstanceAttribute — currently supports GroupId (security groups)."""
+    instance_id = _p(p, "InstanceId")
+    inst = _instances.get(instance_id)
+    if not inst:
+        return _error("InvalidInstanceID.NotFound",
+                      f"The instance ID '{instance_id}' does not exist", 400)
+
+    # Security group changes
+    sg_ids = _parse_member_list(p, "GroupId")
+    if sg_ids:
+        # Validate all SGs exist
+        for sg_id in sg_ids:
+            if sg_id not in _security_groups:
+                return _error("InvalidGroup.NotFound",
+                              f"The security group '{sg_id}' does not exist", 400)
+        # Replace the instance's security groups
+        inst["SecurityGroups"] = [
+            {"GroupId": sg, "GroupName": _security_groups[sg].get("GroupName", sg)}
+            for sg in sg_ids
+        ]
+        # Re-apply iptables with new rules
+        _iptables_apply(instance_id)
+
+    return _xml(200, "ModifyInstanceAttributeResponse", "<return>true</return>")
+
+
 def _describe_instance_attribute(p):
     instance_id = _p(p, "InstanceId")
     attribute = _p(p, "Attribute")
@@ -4843,6 +5140,7 @@ _ACTION_MAP = {
     "DescribeInstanceMaintenanceOptions": _describe_instance_maintenance_options,
     "DescribeInstanceAutoRecoveryAttribute": _describe_instance_auto_recovery_attribute,
     "ModifyInstanceMaintenanceOptions": _modify_instance_maintenance_options,
+    "ModifyInstanceAttribute": _modify_instance_attribute,
     "DescribeInstanceTopology": _describe_instance_topology,
     "DescribeSpotInstanceRequests": _describe_spot_instance_requests,
     "DescribeCapacityReservations": _describe_capacity_reservations,
