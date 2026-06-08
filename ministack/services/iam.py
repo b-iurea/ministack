@@ -913,6 +913,52 @@ def _list_attached_user_policies(p):
 
 # -------------------- Access keys --------------------
 
+# Feature flag: set IAM_ENFORCE=1 to require valid SigV4 signatures.
+_IAM_ENFORCE = os.environ.get("IAM_ENFORCE", "0").strip().lower() in ("1", "true", "yes")
+
+
+def _bootstrap_admin():
+    """Create a default admin user when IAM_ENFORCE=1 so clients can get started."""
+    if not _IAM_ENFORCE:
+        return
+    if "admin" in _users:
+        return
+    import string as _string, random as _random, time as _time
+    now = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())
+    uid = "AIDA" + "".join(_random.choices(_string.ascii_uppercase + _string.digits, k=17))
+    _users["admin"] = {
+        "Arn": f"arn:aws:iam::{get_account_id()}:user/admin",
+        "UserId": uid,
+        "UserName": "admin",
+        "CreateDate": now,
+        "Path": "/",
+        "AttachedPolicies": [],
+        "InlinePolicies": {},
+        "Tags": [],
+    }
+    key_id = "AKIA" + "".join(_random.choices(_string.ascii_uppercase + _string.digits, k=16))
+    secret = new_uuid().replace("-", "") + new_uuid().replace("-", "")[:8]
+    _access_keys[key_id] = {
+        "UserName": "admin",
+        "AccessKeyId": key_id,
+        "SecretAccessKey": secret,
+        "Status": "Active",
+        "CreateDate": now,
+    }
+    logger.info("IAM bootstrap: created admin user (key=%s secret=%s)", key_id, secret)
+
+
+_bootstrap_admin()
+
+
+def _validate_access_key(access_key_id: str) -> dict | None:
+    """Look up an access key. Returns the key record dict on success, None if not found/inactive."""
+    key = _access_keys.get(access_key_id)
+    if not key or key.get("Status") != "Active":
+        return None
+    return dict(key)
+
+
 def _create_access_key(p):
     user_name = _p(p, "UserName")
     if not user_name:
@@ -925,10 +971,11 @@ def _create_access_key(p):
     _access_keys[key_id] = {
         "UserName": user_name,
         "AccessKeyId": key_id,
-        "SecretAccessKey": secret,
+        "SecretAccessKey": secret,  # plaintext — SigV4 needs the actual secret
         "Status": "Active",
         "CreateDate": _now(),
     }
+    # Return the secret — this is the ONLY time it's visible
     return _xml(200, "CreateAccessKeyResponse",
                 f"<CreateAccessKeyResult><AccessKey>"
                 f"<UserName>{user_name}</UserName>"
@@ -1232,6 +1279,9 @@ def _simulate_custom_policy(p):
 
 
 def _build_simulate_results(p):
+    """Evaluate IAM policies against the requested actions using the real engine."""
+    from ministack.services.iam_policy import evaluate as _policy_evaluate
+
     actions = []
     idx = 1
     while True:
@@ -1243,16 +1293,79 @@ def _build_simulate_results(p):
     if not actions:
         actions = ["sts:AssumeRole"]
     resource_arn = _p(p, "ResourceArns.member.1") or "*"
+
+    # Resolve principal from PolicySourceArn
+    source_arn = _p(p, "PolicySourceArn")
+    statements: list[dict] = []
+
+    if source_arn:
+        if ":user/" in source_arn:
+            user_name = source_arn.rsplit(":user/", 1)[-1].split("/")[0]
+            user = _users.get(user_name)
+            if user:
+                # Collect managed policy statements
+                for policy_arn in user.get("AttachedPolicies", []):
+                    pol = _lookup_policy(policy_arn)
+                    if pol:
+                        statements.extend(_policy_stmts(pol))
+                # Collect inline policy statements
+                inlines = _user_inline_policies.get(user_name) or {}
+                for _pname, doc in inlines.items():
+                    statements.extend(_parse_policy_doc_stmts(doc))
+                # Group policies
+                for gname, group in _groups.items():
+                    if user_name in group.get("Users", []):
+                        for gpol_arn in group.get("AttachedPolicies", []):
+                            gpol = _lookup_policy(gpol_arn)
+                            if gpol:
+                                statements.extend(_policy_stmts(gpol))
+
+        elif ":role/" in source_arn:
+            role_name = source_arn.rsplit(":role/", 1)[-1].split("/")[0]
+            role = _roles.get(role_name)
+            if role:
+                for policy_arn in role.get("AttachedPolicies", []):
+                    pol = _lookup_policy(policy_arn)
+                    if pol:
+                        statements.extend(_policy_stmts(pol))
+                for _pname, doc in role.get("InlinePolicies", {}).items():
+                    statements.extend(_parse_policy_doc_stmts(doc))
+
     members = ""
     for action in actions:
+        decision = _policy_evaluate(statements, action, resource_arn)
+        eval_decision = "explicitDeny" if decision == "deny" else \
+                        "allowed" if decision == "allow" else \
+                        "implicitDeny"
         members += (f"<member>"
                     f"<EvalActionName>{action}</EvalActionName>"
                     f"<EvalResourceName>{resource_arn}</EvalResourceName>"
-                    f"<EvalDecision>allowed</EvalDecision>"
+                    f"<EvalDecision>{eval_decision}</EvalDecision>"
                     f"<MatchedStatements></MatchedStatements>"
                     f"<MissingContextValues></MissingContextValues>"
                     f"</member>")
     return members
+
+
+def _policy_stmts(policy: dict) -> list[dict]:
+    """Extract statements from a policy record (including versioned)."""
+    versions = policy.get("Versions", {})
+    if versions:
+        default_ver = policy.get("DefaultVersionId", "")
+        ver = versions.get(default_ver, list(versions.values())[0] if versions else {})
+        doc = ver.get("Document", "")
+        return _parse_policy_doc_stmts(doc)
+    doc = policy.get("PolicyDocument", "")
+    return _parse_policy_doc_stmts(doc)
+
+
+def _parse_policy_doc_stmts(doc) -> list[dict]:
+    """Parse a policy document (str or dict) into a list of statement dicts."""
+    if isinstance(doc, str):
+        doc = json.loads(doc)
+    if isinstance(doc, dict):
+        return doc.get("Statement", [])
+    return []
 
 
 # -------------------- Group management --------------------

@@ -43,35 +43,65 @@
 
 ## 🍴 Fork Features (vs upstream)
 
-This fork replaces mock/in-memory implementations with **real infrastructure**:
+This fork replaces mock/in-memory implementations with **real infrastructure**.
 
-### Tier 1 — Completed ✅
+### Completed ✅
 
 | Feature | Upstream | This Fork |
 |---|---|---|
-| **EC2 Instances** | Mock API responses | Alpine Linux Docker containers with real networking |
-| **EKS Clusters** | Mock | Multi-node k3s Kubernetes (master + worker containers) |
-| **VPCs** | Mock | Isolated Docker bridge networks with real CIDR allocation |
-| **Security Groups** | In-memory rules only | Real iptables rules enforced inside containers (`NET_ADMIN`) |
-| **Multi-region** | Single namespace | `AccountRegionScopedDict` — resources isolated per (account, region) |
+| **EC2 Instances** | Mock API | Alpine Linux Docker containers, real networking, `docker exec` shell |
+| **EKS Clusters** | Mock | Multi-node k3s Kubernetes (master + workers), real `kubectl` |
+| **VPCs** | Mock | Isolated Docker bridge networks, real CIDR, cross-VPC isolation |
+| **Security Groups** | In-memory rules | Real **iptables** inside containers (`NET_ADMIN`), stateful conntrack |
+| **Multi-region** | Single namespace | `AccountRegionScopedDict` — resources per (account, region) |
+| **SG live swap** | N/A | `ModifyInstanceAttribute` → swap SGs at runtime, re-apply iptables |
+| **IAM Identity & Access** | Mock, any key works | Real access keys with **SigV4 validation** (`IAM_ENFORCE=1`) |
+| **IAM Policy Engine** | Always "allowed" | Real Allow/Deny/ImplicitDeny evaluation, wildcard matching |
+| **STS AssumeRole** | Mock credentials | Validates IAM roles, generates session keys validated by SigV4 |
 
-### SG → iptables details
+### IAM → SigV4 enforcement
 
-- `AuthorizeSecurityGroupIngress/Egress` → `docker exec iptables -A MINISTACK_IN/OUT`
-- `RevokeSecurityGroupIngress/Egress` → rules removed, chain rebuilt
-- `ModifyInstanceAttribute` (Groups) → swaps SGs at runtime, re-applies iptables
-- `UserIdGroupPairs` → resolved to referenced SG's VPC CIDR for cross-instance rules
-- Stateful: `ESTABLISHED,RELATED` conntrack for response traffic
-- Multiple SGs per instance: additive (all rules accumulated)
+```bash
+IAM_ENFORCE=1  # activate (default 0 = backward compatible)
 
-### Tier 1 — Roadmap 🚧
+# Bootstrap admin auto-created on startup
+AdminKey=$(docker logs ministack | grep "bootstrap:" | grep -oP 'key=\K[A-Z0-9]+')
+AdminSecret=$(docker logs ministack | grep "bootstrap:" | grep -oP 'secret=\K[a-f0-9]+')
 
-| Feature | Plan |
-|---|---|
-| **ALB/ELB** | Traefik reverse proxy |
-| **API Gateway** | HTTP proxy with path-based routing |
-| **S3** | MinIO container (real S3-compatible storage) |
-| **CloudWatch Logs** | Filesystem-backed log groups |
+# Real SigV4 validation
+export AWS_ACCESS_KEY_ID=$AdminKey
+export AWS_SECRET_ACCESS_KEY=$AdminSecret
+aws --endpoint-url http://localhost:4566 iam create-user --user-name bob  ✅
+export AWS_SECRET_ACCESS_KEY=wrong
+aws --endpoint-url http://localhost:4566 iam get-user --user-name bob   ❌ SignatureDoesNotMatch
+
+# AssumeRole with real credentials
+aws --endpoint-url http://localhost:4566 sts assume-role \
+  --role-arn arn:aws:iam::000000000000:role/MyRole \
+  --role-session-name test
+# → returns valid session credentials usable with boto3
+```
+
+### SG → iptables
+
+```bash
+AuthorizeSecurityGroupIngress → docker exec iptables -A MINISTACK_IN -s 10.1.0.0/16 -p icmp -j ACCEPT
+RevokeSecurityGroupIngress  → chain rebuild without the revoked rule
+UserIdGroupPairs             → resolved to referenced SG's VPC CIDR
+Multiple SGs                 → additive (all rules accumulated)
+Egress revocation            → creates MINISTACK_OUT chain with DROP default
+```
+
+### Roadmap
+
+See [ROADMAP.md](./ROADMAP.md) for the full 67-service real-infrastructure plan.
+
+| Step | Feature | Status |
+|---|---|---|
+| 🔴 Step 3 | **IAM reale** — users, roles, access keys, policy engine, SigV4 | ✅ DONE |
+| 🟠 Step 4 | **S3 → MinIO** — real S3-compatible storage, versioning | Planned |
+| 🟡 Step 5 | **Networking completo** — IGW, NAT, peering, route tables | Planned |
+| 🟢 Step 6 | **ALB/ELB → Traefik** — reverse proxy, listener rules, TLS | Planned |
 
 ---
 

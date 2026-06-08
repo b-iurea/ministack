@@ -17,7 +17,7 @@ from ministack.core.responses import get_account_id, json_response, new_uuid
 
 # Shared helpers — IAM and STS are a natural pair; STS is stateless
 # and reuses IAM's XML builders and credential generators.
-from ministack.services.iam import _error, _future, _gen_secret, _gen_session_access_key, _gen_session_token, _p, _xml
+from ministack.services.iam import _error, _future, _gen_secret, _gen_session_access_key, _gen_session_token, _now, _p, _xml
 
 _sessions: dict[str, dict] = {}
 
@@ -75,16 +75,46 @@ async def handle_request(method, path, headers, body, query_params):
         role_arn = _p(params, "RoleArn")
         session_name = _p(params, "RoleSessionName")
         duration = int(_p(params, "DurationSeconds") or 3600)
+
+        # Look up the role in IAM
+        role_name = role_arn.rsplit(":role/", 1)[-1].split("/")[0] if ":role/" in role_arn else role_arn.rsplit("/", 1)[-1]
+        from ministack.services.iam import _roles, _validate_access_key
+        role = _roles.get(role_name)
+        if not role:
+            return _error(404, "NoSuchEntity", f"Role {role_name} not found.", ns="sts")
+
+        # Validate trust policy (when IAM_ENFORCE=1, check caller credentials)
+        import os
+        iam_enforce = os.environ.get("IAM_ENFORCE", "0").strip().lower() in ("1", "true", "yes")
+        if iam_enforce:
+            trust_doc = role.get("AssumeRolePolicyDocument", "")
+            if isinstance(trust_doc, str):
+                import json
+                trust_doc = json.loads(trust_doc)
+            # For now, trust any principal when the role exists.
+            # Full trust policy validation can be added later.
+
         expiration = _future(duration)
         access_key = _gen_session_access_key()
         secret_key = _gen_secret()
         session_token = _gen_session_token()
-        role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
-        # Real AWS returns the assumed-role ARN under the `sts` service,
-        # not `iam` — e.g. arn:aws:sts::123456789012:assumed-role/demo/TestAR.
+        role_id = role.get("RoleId", "AROA" + new_uuid().replace("-", "")[:17].upper())
         assumed_arn = role_arn.replace(":iam:", ":sts:", 1).replace(":role/", ":assumed-role/", 1)
         if not assumed_arn.endswith(f"/{session_name}"):
             assumed_arn = f"{assumed_arn}/{session_name}"
+
+        # Store session credentials in IAM for SigV4 validation
+        from ministack.services.iam import _access_keys
+        _access_keys[access_key] = {
+            "UserName": f"assumed-role/{role_name}/{session_name}",
+            "AccessKeyId": access_key,
+            "SecretAccessKey": secret_key,
+            "Status": "Active",
+            "CreateDate": _now(),
+            "SessionToken": session_token,
+            "Expiration": expiration,
+            "AssumedRoleArn": assumed_arn,
+        }
         _sessions[access_key] = {"Arn": assumed_arn, "UserId": f"{role_id}:{session_name}"}
         if use_json:
             return json_response({
