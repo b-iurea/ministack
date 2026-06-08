@@ -87,10 +87,9 @@ async def handle_request(method, path, headers, body, query_params):
         import os
         iam_enforce = os.environ.get("IAM_ENFORCE", "0").strip().lower() in ("1", "true", "yes")
         if iam_enforce:
-            trust_doc = role.get("AssumeRolePolicyDocument", "")
-            if isinstance(trust_doc, str):
-                import json
-                trust_doc = json.loads(trust_doc)
+            trust_doc_json = role.get("AssumeRolePolicyDocument", "")
+            if isinstance(trust_doc_json, str):
+                trust_doc_json = json.loads(trust_doc_json)
             # For now, trust any principal when the role exists.
             # Full trust policy validation can be added later.
 
