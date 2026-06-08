@@ -14,9 +14,13 @@ def test_sts_get_caller_identity(sts):
     resp = sts.get_caller_identity()
     assert resp["Account"] == "000000000000"
 
-def test_sts_assume_role_returns_credentials(sts):
+def test_sts_assume_role_returns_credentials(sts, iam):
+    iam.create_role(
+        RoleName="sts-test-role",
+        AssumeRolePolicyDocument='{"Version":"2012-10-17","Statement":[]}',
+    )
     resp = sts.assume_role(
-        RoleArn="arn:aws:iam::000000000000:role/test-role",
+        RoleArn="arn:aws:iam::000000000000:role/sts-test-role",
         RoleSessionName="intg-session",
     )
     creds = resp["Credentials"]
@@ -37,9 +41,13 @@ def test_sts_get_caller_identity_full(sts):
     assert "Arn" in resp
     assert "UserId" in resp
 
-def test_sts_assume_role(sts):
+def test_sts_assume_role(sts, iam):
+    iam.create_role(
+        RoleName="sts-iam-test-role",
+        AssumeRolePolicyDocument='{"Version":"2012-10-17","Statement":[]}',
+    )
     resp = sts.assume_role(
-        RoleArn="arn:aws:iam::000000000000:role/iam-test-role",
+        RoleArn="arn:aws:iam::000000000000:role/sts-iam-test-role",
         RoleSessionName="test-session",
         DurationSeconds=900,
     )
@@ -54,10 +62,14 @@ def test_sts_assume_role(sts):
     assert "AssumedRoleId" in assumed
 
 
-def test_sts_assumed_role_arn_uses_sts_service(sts):
+def test_sts_assumed_role_arn_uses_sts_service(sts, iam):
     """Real AWS returns AssumeRole's AssumedRoleUser.Arn under the sts
     service, not iam — e.g. arn:aws:sts::123456789012:assumed-role/demo/Sess.
     Pinning this against future regressions."""
+    iam.create_role(
+        RoleName="demo",
+        AssumeRolePolicyDocument='{"Version":"2012-10-17","Statement":[]}',
+    )
     resp = sts.assume_role(
         RoleArn="arn:aws:iam::000000000000:role/demo",
         RoleSessionName="TestAR",
@@ -235,8 +247,12 @@ def test_sts_get_web_identity_token_duration_too_long():
     )
     assert status == 400
     assert "ValidationError" in body
-def test_get_caller_identity_reflects_assumed_role(sts_as_role):
+def test_get_caller_identity_reflects_assumed_role(sts_as_role, iam):
     """GetCallerIdentity called with assumed-role creds must return the role ARN, not root."""
+    iam.create_role(
+        RoleName="MyTestRole",
+        AssumeRolePolicyDocument='{"Version":"2012-10-17","Statement":[]}',
+    )
     identity = sts_as_role("arn:aws:iam::000000000000:role/MyTestRole", "caller-identity-session").get_caller_identity()
 
     assert identity["Account"] == "000000000000"
@@ -251,8 +267,13 @@ def test_get_caller_identity_without_assume_role_returns_root(sts):
     assert identity["Arn"] == "arn:aws:iam::000000000000:root"
 
 
-def test_get_caller_identity_different_roles_return_different_arns(sts_as_role):
+def test_get_caller_identity_different_roles_return_different_arns(sts_as_role, iam):
     """Two distinct assumed roles must produce distinct caller identities."""
+    for name in ("RoleA", "RoleB"):
+        iam.create_role(
+            RoleName=name,
+            AssumeRolePolicyDocument='{"Version":"2012-10-17","Statement":[]}',
+        )
     arn_a = sts_as_role("arn:aws:iam::000000000000:role/RoleA", "session-a").get_caller_identity()["Arn"]
     arn_b = sts_as_role("arn:aws:iam::000000000000:role/RoleB", "session-b").get_caller_identity()["Arn"]
 

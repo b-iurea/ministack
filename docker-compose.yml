@@ -6,7 +6,7 @@
 services:
   ministack:
     build:
-      context: ./ministack
+      context: .
       dockerfile: Dockerfile
     image: bogdaniurea/ministack:real-infra
     container_name: ministack
@@ -28,7 +28,7 @@ services:
 
   dashboard:
     build:
-      context: ./ministack-dashboard
+      context: ../ministack-dashboard
       dockerfile: Dockerfile
     image: ministackorg/dashboard:dev
     container_name: ministack-dashboard
